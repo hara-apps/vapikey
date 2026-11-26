@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>Ключ Variational</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<!--
+  miniapp_vapi — ВВОД КЛЮЧА API VARIATIONAL. Поле ТОЛЬКО НА ЗАПИСЬ.
+
+  КУДА УХОДИТ КЛЮЧ. Не в бота и не в Worker: страница берёт у Worker'а билет
+  (`/vapi/ticket`, по подписи Telegram), и с этим билетом шлёт seed ПРЯМО в приёмник на
+  perp-1 (адрес — параметр `vk` ссылки из бота). Приёмник отдаёт его в perp_signer и
+  забывает. Бот, его база и логи ключа не видят.
+
+  ЧЕГО ЗДЕСЬ НЕТ НАРОЧНО:
+    * localStorage / sessionStorage / cookie — ключ не сохраняется нигде на устройстве;
+    * показа ключа обратно — после ответа видны только отпечаток и хвост ПУБЛИЧНОГО ключа;
+    * console.log значения — в журнал вебвью Telegram не уходит ничего;
+    * сторонних скриптов, кроме telegram-web-app.js.
+-->
+<style>
+  :root{ --bg:#150b2e; --card:#221244; --line:#3a2168; --ink:#f3eeff; --dim:#b4a3dd;
+         --ok:#00d395; --bad:#ff6b81; --warn:#ffc24d; }
+  *{ box-sizing:border-box; }
+  body{ margin:0; background:var(--bg); color:var(--ink);
+        font:15px/1.45 -apple-system,system-ui,Segoe UI,Roboto,sans-serif; }
+  main{ max-width:560px; margin:0 auto; padding:16px; }
+  h1{ font-size:19px; margin:4px 0 12px; }
+  .card{ background:var(--card); border:1px solid var(--line); border-radius:12px;
+         padding:14px; margin:0 0 12px; }
+  .warn{ border-color:var(--warn); }
+  .warn p{ margin:0; }
+  label{ display:block; color:var(--dim); margin:0 0 6px; }
+  input{ width:100%; padding:12px; border-radius:10px; border:1px solid var(--line);
+         background:#12092a; color:var(--ink); font:14px ui-monospace,Menlo,monospace; }
+  button{ width:100%; margin-top:10px; padding:12px; border:0; border-radius:10px;
+          background:var(--ok); color:#0a1f18; font-weight:600; font-size:15px; }
+  button:disabled{ opacity:.5; }
+  #state{ white-space:pre-line; }
+  .ok{ color:var(--ok); } .bad{ color:var(--bad); } .dim{ color:var(--dim); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Variational: прокси и ключ</h1>
+  <div class="card warn" id="warning">
+    <p>Ключ API даёт модулю право торговать на вашем счёте Variational: открывать и
+    закрывать позиции. Выводить средства через API сейчас нельзя, но площадка может
+    добавить такую возможность без предупреждения. Поэтому используйте отдельный кошелёк
+    только под этот модуль и держите на нём столько, сколько готовы потерять. Торговля
+    идёт с плечом, возможны убытки вплоть до ликвидации. Вводите приватный ключ (seed), а
+    не публичный — по виду их не отличить. После ввода ключ хранится в зашифрованном виде
+    и больше нигде не показывается.</p>
+  </div>
+  <div class="card">
+    <label for="proxy">1. Прокси — сначала он: ключ проверяется уже через него</label>
+    <input id="proxy" type="password" autocomplete="off" autocapitalize="off"
+           autocorrect="off" spellcheck="false" inputmode="url" maxlength="300"
+           placeholder="http://логин:пароль@хост:порт">
+    <p class="dim">Только HTTP-прокси: SOCKS модуль не применяет. Страна выхода проверяется по
+    правилам Variational, один выходной IP — один человек.</p>
+    <button id="sendProxy">Проверить и привязать</button>
+  </div>
+  <div class="card" id="pstate"><span class="dim">Прокси проверяется до сохранения: при
+  ошибке он не сохраняется. Видно будет только хост и порт.</span></div>
+  <div class="card">
+    <label for="seed">2. Приватный ключ (seed): 0x и 64 знака</label>
+    <input id="seed" type="password" autocomplete="off" autocapitalize="off"
+           autocorrect="off" spellcheck="false" inputmode="text" maxlength="80">
+    <button id="send">Проверить и сохранить</button>
+  </div>
+  <div class="card" id="state"><span class="dim">Ключ проверяется на площадке до
+  сохранения: при ошибке он не сохраняется.</span></div>
+</main>
+<script>
+"use strict";
+var TG = window.Telegram && window.Telegram.WebApp;
+try { TG && TG.ready(); } catch (e) {}
+
+function qp(name) {
+  try { return new URLSearchParams(location.search).get(name) || ''; }
+  catch (e) { return ''; }
+}
+
+/* АДРЕС WORKER'А: из ссылки бота (стенд и прод — разные), иначе вшитый при выкладке. */
+var API_BASE = (function () {
+  var p = qp('api').trim();
+  if (p.indexOf('https://') === 0) return p.replace(/\/+$/, '');
+  var baked = 'https://rtc.harma.cc';
+  return baked.indexOf('{{') === 0 ? '' : baked.replace(/\/+$/, '');
+})();
+
+/* АДРЕС ПРИЁМНИКА: только из ссылки бота и только https с хостом без пути. Вшить его
+   нельзя: страница одна на стенд и прод (организация hara-apps общая). */
+var INTAKE = (function () {
+  var p = qp('vk').trim();
+  try {
+    var u = new URL(p);
+    if (u.protocol === 'https:' && u.hostname && (u.pathname === '/' || u.pathname === ''))
+      return 'https://' + u.host;
+  } catch (e) {}
+  return '';
+})();
+
+var SEED_RE = /^(0x)?[0-9a-fA-F]{64}$/;
+var el = function (id) { return document.getElementById(id); };
+
+function show(cls, text, where) {
+  var s = el(where || 'state');
+  s.textContent = '';
+  var span = document.createElement('span');
+  span.className = cls;
+  span.textContent = text;                 // textContent: ответ не исполняется как HTML
+  s.appendChild(span);
+}
+
+function offWhy() {
+  if (!API_BASE) return 'Страница открыта без адреса бота. Откройте её из бота.';
+  if (!INTAKE) return 'Страница открыта без адреса приёмника. Откройте её из бота.';
+  if (!(TG && TG.initData)) return 'Страница открыта не из Telegram. Откройте её из бота.';
+  return '';
+}
+
+async function ticket() {
+  var r = await fetch(API_BASE + '/vapi/ticket', {
+    method: 'POST', body: '{}',
+    headers: { 'X-Init-Data': TG.initData, 'Content-Type': 'application/json' } });
+  var j = null;
+  try { j = await r.json(); } catch (e) {}
+  if (r.status !== 200 || !j || !j.ticket)
+    throw new Error(r.status === 503 ? 'Ввод ключей не настроен на этом сервере.'
+                                     : 'Пропуск не выдан (HTTP ' + r.status + ').');
+  return j.ticket;
+}
+
+async function send() {
+  var why = offWhy();
+  if (why) { show('bad', why); return; }
+  var input = el('seed');
+  var seed = (input.value || '').trim();
+  input.value = '';                        // поле пустеет ДО сети и до ответа
+  if (!SEED_RE.test(seed)) {
+    seed = '';
+    show('bad', 'Это не ключ: нужен 0x и 64 шестнадцатеричных знака.');
+    return;
+  }
+  el('send').disabled = true;
+  show('dim', 'Проверяю ключ на площадке…');
+  try {
+    var t = await ticket();
+    var r = await fetch(INTAKE + '/vapi/key', {
+      method: 'POST', cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer',
+      headers: { 'Content-Type': 'application/json', 'X-Vapi-Ticket': t },
+      body: JSON.stringify({ seed: seed }) });
+    seed = '';
+    var j = {};
+    try { j = await r.json(); } catch (e) {}
+    if (j && j.ok) {
+      show('ok', 'Ключ принят площадкой (' + (j.env || 'testnet') + ').\n' +
+           'Отпечаток: ' + j.fingerprint + '\nПубличный ключ: …' + j.public_key_tail +
+           '\nEquity: ' + j.equity + '\nСвободно (cross.available): ' + j.available +
+           '\n\nКлюч сохранён в зашифрованном виде и больше не показывается.');
+      try { TG.HapticFeedback && TG.HapticFeedback.notificationOccurred('success'); }
+      catch (e) {}
+    } else {
+      show('bad', (j && j.detail) || ('Ключ не сохранён (HTTP ' + r.status + ').'));
+    }
+  } catch (e) {
+    seed = '';
+    show('bad', (e && e.message) || 'Сеть недоступна. Ключ не сохранён.');
+  } finally {
+    el('send').disabled = false;
+  }
+}
+
+// ПРОКСИ (ТЗ 26.11 §3): то же устройство, что у ключа — поле пустеет до сети,
+// значение уходит только в приёмник, ответ — хост:порт и выход, без пароля.
+var PROXY_RE = /^https?:\/\/[^\s\/]+:\d{1,5}\/?$/;
+async function sendProxy() {
+  var why = offWhy();
+  if (why) { show('bad', why, 'pstate'); return; }
+  var input = el('proxy');
+  var proxy = (input.value || '').trim();
+  input.value = '';                        // поле пустеет ДО сети и до ответа
+  if (/^socks/i.test(proxy)) {
+    proxy = '';
+    show('bad', 'Это SOCKS-прокси, а нужен HTTP: http://логин:пароль@хост:порт. ' +
+         'SOCKS модуль не применяет.', 'pstate');
+    return;
+  }
+  if (!PROXY_RE.test(proxy)) {
+    proxy = '';
+    show('bad', 'Это не адрес прокси: нужен http://логин:пароль@хост:порт.', 'pstate');
+    return;
+  }
+  el('sendProxy').disabled = true;
+  show('dim', 'Проверяю выход прокси…', 'pstate');
+  try {
+    var t = await ticket();
+    var r = await fetch(INTAKE + '/vapi/proxy', {
+      method: 'POST', cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer',
+      headers: { 'Content-Type': 'application/json', 'X-Vapi-Ticket': t },
+      body: JSON.stringify({ proxy: proxy }) });
+    proxy = '';
+    var j = {};
+    try { j = await r.json(); } catch (e) {}
+    if (j && j.ok) {
+      show('ok', 'Прокси привязан: ' + String(j.proxy || '').replace(/^https?:\/\//, '') +
+           '\nВыход: ' + j.country + ' ' + j.exit_ip + '\n\nТеперь ключ.', 'pstate');
+    } else {
+      show('bad', (j && j.detail) || ('Прокси не сохранён (HTTP ' + r.status + ').'), 'pstate');
+    }
+  } catch (e) {
+    proxy = '';
+    show('bad', (e && e.message) || 'Сеть недоступна. Прокси не сохранён.', 'pstate');
+  } finally {
+    el('sendProxy').disabled = false;
+  }
+}
+
+el('send').addEventListener('click', send);
+el('sendProxy').addEventListener('click', sendProxy);
+(function () { var w = offWhy(); if (w) show('bad', w); })();
+</script>
+</body>
+</html>
